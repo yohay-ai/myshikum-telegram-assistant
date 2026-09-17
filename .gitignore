@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.rehab_checker_state/
+browser_state.json
+session_storage.json
+seen_messages.json
+*.log
+.DS_Store
