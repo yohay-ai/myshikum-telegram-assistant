@@ -36,9 +36,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
+import random
 import shutil
 import stat
 import time
@@ -74,9 +76,67 @@ OTP_CONTACT = os.getenv("OTP_CONTACT", "").strip()
 HEADLESS = os.getenv("HEADLESS", "true").strip().lower() not in {"0", "false", "no"}
 BROWSER_EXECUTABLE = os.getenv("BROWSER_EXECUTABLE", "").strip()
 STATE_DIR = Path(os.getenv("STATE_DIR", ".rehab_checker_state")).expanduser().resolve()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+AUTOCHECK_INTERVAL_MINUTES_RAW = os.getenv("AUTOCHECK_INTERVAL_MINUTES", "60").strip()
+MIN_AUTOCHECK_INTERVAL_MINUTES = 15
+MAX_AUTOCHECK_BACKOFF_SECONDS = 6 * 60 * 60
 BROWSER_STATE = STATE_DIR / "browser_state.json"
 SESSION_STORAGE = STATE_DIR / "session_storage.json"
 SEEN_MESSAGES = STATE_DIR / "seen_messages.json"
+
+
+LOGGER = logging.getLogger("myshikum_assistant")
+
+
+def configure_logging() -> None:
+    """Configure operational logs that never include user-controlled or secret data."""
+    level = getattr(logging, LOG_LEVEL, logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s event=%(message)s"
+    ))
+    LOGGER.handlers.clear()
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(level)
+    LOGGER.propagate = False
+    # Third-party debug logs may contain request URLs or browser data.
+    for name in ("telegram", "httpx", "httpcore", "playwright", "asyncio"):
+        third_party = logging.getLogger(name)
+        third_party.handlers.clear()
+        third_party.propagate = False
+        third_party.disabled = True
+
+
+def log_event(event: str, *, level: int = logging.INFO, error: BaseException | None = None) -> None:
+    """Log only a fixed event name and, when useful, the exception class."""
+    safe_event = re.sub(r"[^a-z0-9_.-]", "_", event.lower())[:80]
+    if error is None:
+        LOGGER.log(level, safe_event)
+    else:
+        LOGGER.log(level, "%s error_type=%s", safe_event, type(error).__name__)
+
+
+HELP_TEXT = """פקודות זמינות:
+/check - בדיקת שינויים בפניות
+/new_request - הכנת פנייה חדשה
+/review - הצגת הטיוטה ואישור מפורש לפני שליחה
+/cancel - ביטול הפעולה ומחיקת קבצים זמניים
+/logout - מחיקת מצב ההתחברות המקומי
+/whoami - הצגת מזהה הצ'אט להגדרה
+/autocheck_start - הפעלת בדיקות אוטומטיות עד לאתחול הבא
+/autocheck_stop - עצירת בדיקות אוטומטיות עד לאתחול הבא
+/autocheck_status - הצגת הגדרת ומצב הבדיקות האוטומטיות
+/help - הצגת העזרה הזו
+
+הבוט לא שולח פנייה בלי לחיצה על אישור ושליחה במסך הסיכום."""
+
+
+def configured_autocheck_interval() -> int | None:
+    try:
+        value = int(AUTOCHECK_INTERVAL_MINUTES_RAW)
+    except ValueError:
+        return None
+    return value if value >= MIN_AUTOCHECK_INTERVAL_MINUTES else None
 
 
 def configured_chat_id() -> int | None:
@@ -301,6 +361,10 @@ class LoginRun:
 
 RUNS: dict[int, LoginRun] = {}
 RUNS_LOCK = asyncio.Lock()
+AUTOCHECK_TASK: asyncio.Task[None] | None = None
+AUTOCHECK_STOP: asyncio.Event | None = None
+AUTOCHECK_LAST_SUCCESS: float | None = None
+AUTOCHECK_LAST_FAILURE: str | None = None
 
 
 def authorized(update: Update) -> bool:
@@ -309,6 +373,7 @@ def authorized(update: Update) -> bool:
 
 
 async def deny(update: Update) -> None:
+    log_event("authorization.denied", level=logging.WARNING)
     if update.effective_message:
         await update.effective_message.reply_text("הבוט הזה מוגבל לצ'אט שהוגדר מראש.")
 
@@ -430,6 +495,7 @@ def browser_launch_candidates() -> list[tuple[str, dict[str, object]]]:
 
 
 async def start_browser() -> LoginRun:
+    log_event("browser.starting")
     pw = await async_playwright().start()
     browser: Browser | None = None
     failures: list[str] = []
@@ -437,6 +503,7 @@ async def start_browser() -> LoginRun:
         for label, launch_options in browser_launch_candidates():
             try:
                 browser = await pw.chromium.launch(**launch_options)
+                log_event("browser.started")
                 break
             except Exception as exc:
                 failures.append(f"{label}: {normalize(str(exc))[:500]}")
@@ -463,6 +530,7 @@ async def start_browser() -> LoginRun:
             except Exception:
                 pass
         await pw.stop()
+        log_event("browser.start_failed", level=logging.ERROR)
         raise
 
 
@@ -471,6 +539,7 @@ async def cleanup(chat_id: int) -> None:
         run = RUNS.pop(chat_id, None)
     if not run:
         return
+    log_event("run.cleanup")
     if run.inquiry:
         temp_dirs: set[Path] = set()
         for path in run.inquiry.attachments:
@@ -736,8 +805,8 @@ def load_seen_state() -> tuple[str, dict[str, object]]:
         return "invalid", {}
     if isinstance(value, list):
         return "legacy", {}
-    if isinstance(value, dict) and value.get("version") == 2 and isinstance(value.get("applications"), dict):
-        return "v2", value
+    if isinstance(value, dict) and value.get("version") in {2, 3} and isinstance(value.get("applications"), dict):
+        return "v2" if value.get("version") == 2 else "v3", value
     return "invalid", {}
 
 
@@ -776,7 +845,7 @@ def delta_messages(applications: list[str]) -> tuple[list[str], str]:
     are not emitted. Legacy whole-page/card hash lists are migrated quietly.
     """
     state_kind, previous_state = load_seen_state()
-    previous_apps = previous_state.get("applications", {}) if state_kind == "v2" else {}
+    previous_apps = previous_state.get("applications", {}) if state_kind in {"v2", "v3"} else {}
     current_apps: dict[str, dict[str, object]] = {}
     raw_by_id: dict[str, str] = {}
 
@@ -790,7 +859,13 @@ def delta_messages(applications: list[str]) -> tuple[list[str], str]:
         current_apps[app_id] = snapshot
         raw_by_id[app_id] = raw
 
-    secure_write_json(SEEN_MESSAGES, {"version": 2, "applications": current_apps})
+    # Persist only opaque application identifiers and content digests. Human-readable
+    # subjects, statuses, inquiry text, events, and attachment data stay in memory.
+    persisted_apps = {
+        app_id: {"raw_digest": snapshot["raw_digest"]}
+        for app_id, snapshot in current_apps.items()
+    }
+    secure_write_json(SEEN_MESSAGES, {"version": 3, "applications": persisted_apps})
 
     if state_kind in {"legacy", "invalid"}:
         return [], "migrated"
@@ -970,8 +1045,10 @@ async def inquiry_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             number = await submit_inquiry(run.page, draft)
             await save_browser_session(run)
             await cleanup(chat_id)
+            log_event("inquiry.submitted")
             await update.effective_chat.send_message(f"הפנייה נשלחה. מספר הפנייה: {number}")
         except Exception as exc:
+            log_event("inquiry.submit_uncertain", level=logging.ERROR, error=exc)
             # Never retry automatically. The request may have reached the server.
             await cleanup(chat_id)
             await update.effective_chat.send_message(
@@ -1038,6 +1115,7 @@ def inquiry_summary(draft: InquiryDraft) -> str:
 
 
 async def review_inquiry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log_event("command.review")
     if not authorized(update) or not update.effective_chat or not update.effective_message:
         return
     run = RUNS.get(update.effective_chat.id)
@@ -1097,6 +1175,7 @@ async def submit_inquiry(page: Page, draft: InquiryDraft) -> str:
 
 
 async def new_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log_event("command.new_request")
     if not authorized(update):
         await deny(update)
         return
@@ -1125,6 +1204,7 @@ async def new_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "ההודעה עם הקוד תימחק אם Telegram יאפשר זאת."
         )
     except Exception as exc:
+        log_event("inquiry.open_failed", level=logging.ERROR, error=exc)
         await cleanup(chat_id)
         await update.effective_message.reply_text("לא הצלחתי לפתוח את טופס הפנייה: " + normalize(str(exc))[:800])
 
@@ -1149,12 +1229,167 @@ async def send_results(update: Update, run: LoginRun) -> None:
         await update.effective_message.reply_text(message)
 
 
+async def periodic_check_once(app: Application) -> tuple[bool, str]:
+    """Run one read-only cycle. Return success and a privacy-safe result code."""
+    global AUTOCHECK_LAST_SUCCESS, AUTOCHECK_LAST_FAILURE
+    chat_id = configured_chat_id()
+    if chat_id is None:
+        return False, "invalid_config"
+    async with RUNS_LOCK:
+        if chat_id in RUNS:
+            return True, "busy_skipped"
+        run = await start_browser()
+        RUNS[chat_id] = run
+    try:
+        if not await goto_applies(run.page):
+            return False, "login_required"
+        await save_browser_session(run)
+        applications = await application_texts(run.page)
+        if not applications:
+            return False, "page_unreadable"
+        messages, mode = delta_messages(applications)
+        if messages and mode not in {"first", "migrated"}:
+            heading = "נמצאו עדכונים חדשים:"
+            for message in split_telegram_messages(heading, messages):
+                await app.bot.send_message(chat_id=chat_id, text=message)
+        AUTOCHECK_LAST_SUCCESS = time.time()
+        AUTOCHECK_LAST_FAILURE = None
+        return True, "changes_sent" if messages and mode == "delta" else "baseline_or_no_change"
+    finally:
+        await cleanup(chat_id)
+
+
+async def autocheck_loop(app: Application) -> None:
+    """Run serialized checks with jitter and bounded exponential failure backoff."""
+    global AUTOCHECK_LAST_FAILURE
+    interval = configured_autocheck_interval()
+    if interval is None:
+        log_event("autocheck.invalid_interval", level=logging.ERROR)
+        return
+    stop = AUTOCHECK_STOP
+    if stop is None:
+        return
+    failure_count = 0
+    log_event("autocheck.started")
+    while not stop.is_set():
+        result = "unexpected_failure"
+        try:
+            success, result = await periodic_check_once(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            success = False
+            result = type(exc).__name__
+            log_event("autocheck.cycle_failed", level=logging.ERROR, error=exc)
+        if success:
+            failure_count = 0
+        else:
+            failure_count += 1
+            # Notify once per failure kind. Do not echo exception text or private data.
+            if result != AUTOCHECK_LAST_FAILURE:
+                AUTOCHECK_LAST_FAILURE = result
+                if result == "login_required":
+                    text = "הבדיקה האוטומטית זקוקה להתחברות מחדש. הפעל /check והזן את הקוד החד-פעמי."
+                elif result == "invalid_config":
+                    text = "הבדיקה האוטומטית נעצרה בגלל הגדרה לא תקינה. בדוק את משתני הסביבה והפעל מחדש."
+                elif result == "page_unreadable":
+                    text = "הבדיקה האוטומטית לא הצליחה לקרוא את דף הפניות. ייתכן שהאתר השתנה; נסה /check ידנית."
+                else:
+                    text = "הבדיקה האוטומטית נכשלה. אנסה שוב בהשהיה; אם זה נמשך, נסה /check ידנית."
+                chat_id = configured_chat_id()
+                if chat_id is not None:
+                    await app.bot.send_message(chat_id=chat_id, text=text)
+        base_seconds = interval * 60
+        if failure_count:
+            base_seconds = min(base_seconds * (2 ** min(failure_count - 1, 5)), MAX_AUTOCHECK_BACKOFF_SECONDS)
+        delay = base_seconds * random.uniform(0.9, 1.1)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+    log_event("autocheck.stopped")
+
+
+def autocheck_running() -> bool:
+    return AUTOCHECK_TASK is not None and not AUTOCHECK_TASK.done()
+
+
+async def start_autocheck(app: Application) -> bool:
+    global AUTOCHECK_TASK, AUTOCHECK_STOP
+    if autocheck_running():
+        return True
+    if configured_autocheck_interval() is None:
+        return False
+    AUTOCHECK_STOP = asyncio.Event()
+    AUTOCHECK_TASK = asyncio.create_task(autocheck_loop(app), name="autocheck")
+    return True
+
+
+async def stop_autocheck() -> None:
+    global AUTOCHECK_TASK, AUTOCHECK_STOP
+    if AUTOCHECK_STOP is not None:
+        AUTOCHECK_STOP.set()
+    task = AUTOCHECK_TASK
+    if task is not None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    AUTOCHECK_TASK = None
+    AUTOCHECK_STOP = None
+
+
+async def autocheck_start_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        await deny(update)
+        return
+    if configured_autocheck_interval() is None:
+        await update.effective_message.reply_text(
+            f"AUTOCHECK_INTERVAL_MINUTES חייב להיות מספר של לפחות {MIN_AUTOCHECK_INTERVAL_MINUTES}."
+        )
+        return
+    already = autocheck_running()
+    await start_autocheck(ctx.application)
+    text = "הבדיקה האוטומטית כבר פעילה." if already else "הבדיקה האוטומטית הופעלה לזמן הריצה הנוכחי."
+    await update.effective_message.reply_text(text)
+
+
+async def autocheck_stop_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        await deny(update)
+        return
+    was_running = autocheck_running()
+    await stop_autocheck()
+    await update.effective_message.reply_text(
+        "הבדיקה האוטומטית נעצרה." if was_running else "הבדיקה האוטומטית אינה פעילה."
+    )
+
+
+async def autocheck_status_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        await deny(update)
+        return
+    interval = configured_autocheck_interval()
+    running = "פעילה" if autocheck_running() else "לא פעילה"
+    interval_text = str(interval) if interval is not None else "לא תקין"
+    await update.effective_message.reply_text(
+        f"הפעלה באתחול: כבויה תמיד\nמצב נוכחי: {running}\nמרווח בסיסי: {interval_text} דקות"
+    )
+
+
+async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_message:
+        log_event("command.help")
+        await update.effective_message.reply_text(HELP_TEXT)
+
+
 async def whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat and update.effective_message:
         await update.effective_message.reply_text(f"מזהה הצ'אט: {update.effective_chat.id}")
 
 
 async def check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log_event("command.check")
     if not authorized(update):
         await deny(update)
         return
@@ -1183,6 +1418,7 @@ async def check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "ההודעה עם הקוד תימחק מהצ'אט אם Telegram יאפשר זאת."
         )
     except Exception as exc:
+        log_event("check.failed", level=logging.ERROR, error=exc)
         await cleanup(chat_id)
         await update.effective_message.reply_text(
             "לא הצלחתי להגיע למסך הקוד. " + normalize(str(exc))[:800] +
@@ -1245,11 +1481,13 @@ async def handle_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await send_results(update, run)
         await cleanup(chat_id)
     except Exception as exc:
+        log_event("otp.check_failed", level=logging.ERROR, error=exc)
         await cleanup(chat_id)
         await update.effective_chat.send_message("הבדיקה נכשלה אחרי הקוד: " + normalize(str(exc))[:800])
 
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log_event("command.cancel")
     if not authorized(update):
         await deny(update)
         return
@@ -1258,6 +1496,7 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log_event("command.logout")
     if not authorized(update):
         await deny(update)
         return
@@ -1271,15 +1510,22 @@ async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def shutdown(app: Application) -> None:
+    await stop_autocheck()
     for chat_id in list(RUNS):
         await cleanup(chat_id)
 
 
 def main() -> None:
+    configure_logging()
     if not TOKEN:
         raise SystemExit("Set TELEGRAM_TOKEN in the environment; never paste it into the source file.")
     secure_state_dir()
     app = ApplicationBuilder().token(TOKEN).post_shutdown(shutdown).build()
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("start", help_command))
+    app.add_handler(CommandHandler("autocheck_start", autocheck_start_command))
+    app.add_handler(CommandHandler("autocheck_stop", autocheck_stop_command))
+    app.add_handler(CommandHandler("autocheck_status", autocheck_status_command))
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("check", check))
     app.add_handler(CommandHandler("new_request", new_request))
@@ -1290,7 +1536,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, inquiry_attachment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, inquiry_text), group=0)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_otp), group=1)
-    print("Bot is running. Use /whoami once, then configure AUTHORIZED_CHAT_ID and restart.")
+    log_event("bot.started")
     app.run_polling(drop_pending_updates=True, allowed_updates=["message"])
 
 
