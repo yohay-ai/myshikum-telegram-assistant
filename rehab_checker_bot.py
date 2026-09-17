@@ -981,10 +981,13 @@ async def start_inquiry_ui(chat_id: int, update: Update, run: LoginRun) -> None:
 
 
 async def inquiry_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log_event("inquiry.callback_received")
     query = update.callback_query
     if not query or not authorized(update) or not update.effective_chat:
+        log_event("inquiry.callback_rejected", level=logging.WARNING)
         return
     await query.answer()
+    log_event("inquiry.callback_matched")
     chat_id = update.effective_chat.id
     run = RUNS.get(chat_id)
     if not run or not run.inquiry:
@@ -992,15 +995,23 @@ async def inquiry_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
     draft = run.inquiry
     data = query.data or ""
+    action = data.split(":", 2)[1] if data.startswith("ir:") and ":" in data else "unknown"
+    allowed_actions = {"cancel", "edit", "mode", "category", "subcategory", "send"}
+    if action not in allowed_actions:
+        log_event("inquiry.callback_unmatched", level=logging.WARNING)
+        return
+    log_event(f"inquiry.callback_processing.{action}")
     if data == "ir:cancel":
         await cleanup(chat_id)
         await query.edit_message_text("הפנייה בוטלה. לא נשלח דבר.")
+        log_event("inquiry.callback_succeeded.cancel")
         return
     if data == "ir:edit":
         draft.text = ""
         draft.confirmation_nonce = ""
         draft.stage = "awaiting_text"
         await query.edit_message_text("שלח מחדש את הטקסט המדויק של הפנייה.")
+        log_event("inquiry.callback_succeeded.edit")
         return
     if data.startswith("ir:mode:"):
         index = int(data.rsplit(":", 1)[1])
@@ -1014,6 +1025,7 @@ async def inquiry_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             raise RuntimeError("לא נמצאו קטגוריות פעילות בטופס הרשמי.")
         draft.stage = "choose_category"
         await query.edit_message_text("בחר קטגוריה:", reply_markup=choice_keyboard("category", draft.choices))
+        log_event("inquiry.callback_succeeded.mode")
         return
     if data.startswith("ir:category:"):
         index = int(data.rsplit(":", 1)[1])
@@ -1029,6 +1041,7 @@ async def inquiry_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             f"קטגוריה: {draft.category}\nבחר תת-קטגוריה:",
             reply_markup=choice_keyboard("subcategory", draft.choices),
         )
+        log_event("inquiry.callback_succeeded.category")
         return
     if data.startswith("ir:subcategory:"):
         index = int(data.rsplit(":", 1)[1])
@@ -1041,6 +1054,7 @@ async def inquiry_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             f"היעד שנבחר: {draft.mode} > {draft.category} > {draft.subcategory}\n"
             f"שלח עכשיו את הטקסט המדויק של הפנייה (עד {MAX_INQUIRY_TEXT} תווים)."
         )
+        log_event("inquiry.callback_succeeded.subcategory")
         return
     if data.startswith("ir:send:"):
         nonce = data.rsplit(":", 1)[1]
@@ -1060,8 +1074,9 @@ async def inquiry_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             await cleanup(chat_id)
             log_event("inquiry.submitted")
             await update.effective_chat.send_message(f"הפנייה נשלחה. מספר הפנייה: {number}")
+            log_event("inquiry.callback_succeeded.send")
         except Exception as exc:
-            log_event("inquiry.submit_uncertain", level=logging.ERROR, error=exc)
+            log_event("inquiry.callback_error.send", level=logging.ERROR, error=exc)
             # Never retry automatically. The request may have reached the server.
             await cleanup(chat_id)
             await update.effective_chat.send_message(
@@ -1552,7 +1567,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, inquiry_text), group=0)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_otp), group=1)
     log_event("bot.started")
-    app.run_polling(drop_pending_updates=True, allowed_updates=["message"])
+    app.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
