@@ -37,7 +37,7 @@ jobs:
           -e OTP_CONTACT=0500000000
           myshikum-telegram-assistant:test
           python -m unittest discover -s tests -v
-      - name: Container smoke check
+      - name: Container config smoke check
         run: >-
           docker run --rm
           -e TELEGRAM_TOKEN=test-token
@@ -46,7 +46,13 @@ jobs:
           -e OTP_CHANNEL=phone
           -e OTP_CONTACT=0500000000
           myshikum-telegram-assistant:test
-          python -c "import rehab_checker_bot as b; assert not b.valid_config(); print('smoke-ok')"
+          python -c "import rehab_checker_bot as b; assert not b.valid_config(); print('config-smoke-ok')"
+      - name: Launch Chromium as non-root runtime user
+        run: >-
+          docker run --rm
+          --entrypoint python
+          myshikum-telegram-assistant:test
+          -c "import asyncio; from playwright.async_api import async_playwright; exec('async def smoke():\n async with async_playwright() as p:\n  browser = await p.chromium.launch(channel=\"chromium\", headless=True, args=[\"--disable-dev-shm-usage\"]); print(browser.version); await browser.close()\nasyncio.run(smoke())')"
 
   publish:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
