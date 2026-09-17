@@ -1,10 +1,13 @@
 FROM python:3.12-slim-bookworm
 
+ARG VCS_REF=dev
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HEADLESS=true \
     STATE_DIR=/app/state \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    APP_VERSION=${VCS_REF}
 
 WORKDIR /app
 
@@ -23,5 +26,8 @@ COPY --chown=bot:bot tests ./tests
 
 USER bot
 VOLUME ["/app/state"]
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD ["python", "rehab_checker_bot.py", "--healthcheck"]
 
 CMD ["python", "rehab_checker_bot.py"]

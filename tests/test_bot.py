@@ -119,7 +119,7 @@ class BotTests(unittest.TestCase):
         source = (ROOT / "rehab_checker_bot.py").read_text()
         self.assertNotIn("AUTOCHECK_ENABLED", example)
         self.assertNotIn("AUTOCHECK_ENABLED", source)
-        self.assertNotIn("post_init(", source)
+        self.assertNotIn("post_init(start_autocheck", source)
         self.assertIn("AUTOCHECK_INTERVAL_MINUTES=60", example)
         self.assertIn('CommandHandler("autocheck_start"', source)
         self.assertIn('CommandHandler("autocheck_stop"', source)
@@ -176,6 +176,37 @@ class BotTests(unittest.TestCase):
         draft = bot.InquiryDraft(mode="לפי נושא", category="רפואה", subcategory="החזרים", text="שלום")
         with self.assertRaisesRegex(RuntimeError, "אינו תואם"):
             asyncio.run(bot.submit_inquiry(page, draft))
+
+    def test_diagnostics_are_operational_and_exclude_personal_values(self):
+        text = bot.diagnostics_text()
+        for label in ("גרסה:", "זמן ריצה:", "Chromium:", "session:", "autocheck:"):
+            self.assertIn(label, text)
+        for secret in (bot.TOKEN, bot.PERSONAL_ID, bot.OTP_CONTACT, bot.AUTHORIZED_CHAT_ID_RAW):
+            self.assertNotIn(secret, text)
+
+    def test_operation_reservation_is_atomic(self):
+        original = dict(bot.ACTIVE_OPERATIONS)
+        bot.ACTIVE_OPERATIONS.clear()
+        try:
+            self.assertTrue(asyncio.run(bot.reserve_operation(123, "check")))
+            self.assertFalse(asyncio.run(bot.reserve_operation(123, "autocheck")))
+            asyncio.run(bot.cleanup(123))
+            self.assertTrue(asyncio.run(bot.reserve_operation(123, "autocheck")))
+        finally:
+            bot.ACTIVE_OPERATIONS.clear()
+            bot.ACTIVE_OPERATIONS.update(original)
+
+    def test_healthcheck_rejects_stale_heartbeat(self):
+        original = bot.HEALTH_FILE
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                bot.HEALTH_FILE = Path(d) / "heartbeat"
+                bot.HEALTH_FILE.touch()
+                self.assertEqual(bot.container_healthcheck(), 0)
+                os.utime(bot.HEALTH_FILE, (1, 1))
+                self.assertEqual(bot.container_healthcheck(), 1)
+        finally:
+            bot.HEALTH_FILE = original
 
 
 if __name__ == "__main__":

@@ -39,10 +39,12 @@ import json
 import logging
 import os
 import platform
+import subprocess
 import re
 import random
 import shutil
 import stat
+import sys
 import time
 import tempfile
 import secrets
@@ -83,6 +85,9 @@ MAX_AUTOCHECK_BACKOFF_SECONDS = 6 * 60 * 60
 BROWSER_STATE = STATE_DIR / "browser_state.json"
 SESSION_STORAGE = STATE_DIR / "session_storage.json"
 SEEN_MESSAGES = STATE_DIR / "seen_messages.json"
+HEALTH_FILE = Path(os.getenv("HEALTH_FILE", "/tmp/myshikum-heartbeat"))
+APP_VERSION = os.getenv("APP_VERSION", "dev").strip() or "dev"
+STARTED_AT = time.time()
 
 
 LOGGER = logging.getLogger("myshikum_assistant")
@@ -126,6 +131,7 @@ HELP_TEXT = """פקודות זמינות:
 /autocheck_start - הפעלת בדיקות אוטומטיות עד לאתחול הבא
 /autocheck_stop - עצירת בדיקות אוטומטיות עד לאתחול הבא
 /autocheck_status - הצגת הגדרת ומצב הבדיקות האוטומטיות
+/diagnostics - מצב תפעולי בטוח, ללא מידע אישי
 /help - הצגת העזרה הזו
 
 הבוט לא שולח פנייה בלי לחיצה על אישור ושליחה במסך הסיכום."""
@@ -365,6 +371,81 @@ AUTOCHECK_TASK: asyncio.Task[None] | None = None
 AUTOCHECK_STOP: asyncio.Event | None = None
 AUTOCHECK_LAST_SUCCESS: float | None = None
 AUTOCHECK_LAST_FAILURE: str | None = None
+ACTIVE_OPERATIONS: dict[int, str] = {}
+HEARTBEAT_TASK: asyncio.Task[None] | None = None
+HEARTBEAT_STOP: asyncio.Event | None = None
+
+
+async def reserve_operation(chat_id: int, name: str) -> bool:
+    """Atomically reserve the browser slot shared by manual and automatic work."""
+    async with RUNS_LOCK:
+        if chat_id in ACTIVE_OPERATIONS:
+            return False
+        ACTIVE_OPERATIONS[chat_id] = name
+        return True
+
+
+def session_state() -> str:
+    if not BROWSER_STATE.exists() and not SESSION_STORAGE.exists():
+        return "לא נשמר"
+    return "שמור (לא אומת מול האתר)"
+
+
+def diagnostics_text() -> str:
+    interval = configured_autocheck_interval()
+    last_success = "אין" if AUTOCHECK_LAST_SUCCESS is None else time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(AUTOCHECK_LAST_SUCCESS))
+    browser_hint = "מוגדר" if BROWSER_EXECUTABLE and Path(BROWSER_EXECUTABLE).is_file() else "Playwright bundled"
+    return (
+        f"גרסה: {APP_VERSION[:80]}\n"
+        f"זמן ריצה: {int(max(0, time.time() - STARTED_AT))} שניות\n"
+        f"Chromium: {browser_hint}\n"
+        f"session: {session_state()}\n"
+        f"פעולה פעילה: {'כן' if ACTIVE_OPERATIONS else 'לא'}\n"
+        f"autocheck: {'פעיל' if autocheck_running() else 'כבוי'}\n"
+        f"מרווח autocheck: {interval if interval is not None else 'לא תקין'} דקות\n"
+        f"בדיקה מוצלחת אחרונה: {last_success}"
+    )
+
+
+async def heartbeat_loop() -> None:
+    stop = HEARTBEAT_STOP
+    if stop is None:
+        return
+    while not stop.is_set():
+        try:
+            HEALTH_FILE.touch(mode=0o600, exist_ok=True)
+        except OSError as exc:
+            log_event("health.heartbeat_failed", level=logging.ERROR, error=exc)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=20)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def application_post_init(app: Application) -> None:
+    global HEARTBEAT_TASK, HEARTBEAT_STOP
+    HEARTBEAT_STOP = asyncio.Event()
+    HEARTBEAT_TASK = asyncio.create_task(heartbeat_loop(), name="health-heartbeat")
+
+
+async def application_post_shutdown(app: Application) -> None:
+    global HEARTBEAT_TASK, HEARTBEAT_STOP
+    if HEARTBEAT_STOP is not None:
+        HEARTBEAT_STOP.set()
+    if HEARTBEAT_TASK is not None:
+        await HEARTBEAT_TASK
+    HEARTBEAT_TASK = None
+    HEARTBEAT_STOP = None
+
+
+def container_healthcheck() -> int:
+    if valid_config():
+        return 1
+    try:
+        age = time.time() - HEALTH_FILE.stat().st_mtime
+    except OSError:
+        return 1
+    return 0 if age <= 90 else 1
 
 
 def authorized(update: Update) -> bool:
@@ -537,6 +618,7 @@ async def start_browser() -> LoginRun:
 async def cleanup(chat_id: int) -> None:
     async with RUNS_LOCK:
         run = RUNS.pop(chat_id, None)
+        ACTIVE_OPERATIONS.pop(chat_id, None)
     if not run:
         return
     log_event("run.cleanup")
@@ -1212,10 +1294,9 @@ async def new_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("חסרה הגדרה: " + ", ".join(missing))
         return
     chat_id = update.effective_chat.id
-    async with RUNS_LOCK:
-        if chat_id in RUNS:
-            await update.effective_message.reply_text("כבר מתבצעת פעולה. סיים אותה או הפעל /cancel.")
-            return
+    if not await reserve_operation(chat_id, "new_request"):
+        await update.effective_message.reply_text("כבר מתבצעת פעולה. סיים אותה או הפעל /cancel.")
+        return
     await update.effective_message.reply_text("פותח את טופס הפנייה הרשמי...")
     log_event("inquiry.open_started")
     try:
@@ -1227,6 +1308,7 @@ async def new_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             log_event("inquiry.existing_session_found")
             await start_inquiry_ui(chat_id, update, run)
             return
+        await update.effective_message.reply_text("ה-session פג או לא קיים. מתחיל התחברות מחדש.")
         await begin_otp_login(run.page)
         run.otp_deadline = time.monotonic() + OTP_TTL_SECONDS
         await update.effective_message.reply_text(
@@ -1265,12 +1347,12 @@ async def periodic_check_once(app: Application) -> tuple[bool, str]:
     chat_id = configured_chat_id()
     if chat_id is None:
         return False, "invalid_config"
-    async with RUNS_LOCK:
-        if chat_id in RUNS:
-            return True, "busy_skipped"
-        run = await start_browser()
-        RUNS[chat_id] = run
+    if not await reserve_operation(chat_id, "autocheck"):
+        return True, "busy_skipped"
     try:
+        run = await start_browser()
+        async with RUNS_LOCK:
+            RUNS[chat_id] = run
         if not await goto_applies(run.page):
             return False, "login_required"
         await save_browser_session(run)
@@ -1407,6 +1489,14 @@ async def autocheck_status_command(update: Update, ctx: ContextTypes.DEFAULT_TYP
     )
 
 
+async def diagnostics_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log_event("command.diagnostics")
+    if not authorized(update):
+        await deny(update)
+        return
+    await update.effective_message.reply_text(diagnostics_text())
+
+
 async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message:
         log_event("command.help")
@@ -1428,10 +1518,9 @@ async def check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("חסרה הגדרה: " + ", ".join(missing))
         return
     chat_id = update.effective_chat.id
-    async with RUNS_LOCK:
-        if chat_id in RUNS:
-            await update.effective_message.reply_text("כבר מתבצעת בדיקה. שלח את הקוד בן 4 הספרות, או /cancel.")
-            return
+    if not await reserve_operation(chat_id, "check"):
+        await update.effective_message.reply_text("כבר מתבצעת פעולה. המתן לסיומה או הפעל /cancel אם זו פעולה ידנית.")
+        return
     await update.effective_message.reply_text("בודק את האזור האישי...")
     try:
         run = await start_browser()
@@ -1441,6 +1530,7 @@ async def check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await send_results(update, run)
             await cleanup(chat_id)
             return
+        await update.effective_message.reply_text("ה-session פג או לא קיים. מתחיל התחברות מחדש.")
         await begin_otp_login(run.page)
         run.otp_deadline = time.monotonic() + OTP_TTL_SECONDS
         await update.effective_message.reply_text(
@@ -1540,6 +1630,7 @@ async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def shutdown(app: Application) -> None:
+    await application_post_shutdown(app)
     await stop_autocheck()
     for chat_id in list(RUNS):
         await cleanup(chat_id)
@@ -1550,12 +1641,19 @@ def main() -> None:
     if not TOKEN:
         raise SystemExit("Set TELEGRAM_TOKEN in the environment; never paste it into the source file.")
     secure_state_dir()
-    app = ApplicationBuilder().token(TOKEN).post_shutdown(shutdown).build()
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(application_post_init)
+        .post_shutdown(shutdown)
+        .build()
+    )
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("start", help_command))
     app.add_handler(CommandHandler("autocheck_start", autocheck_start_command))
     app.add_handler(CommandHandler("autocheck_stop", autocheck_stop_command))
     app.add_handler(CommandHandler("autocheck_status", autocheck_status_command))
+    app.add_handler(CommandHandler("diagnostics", diagnostics_command))
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("check", check))
     app.add_handler(CommandHandler("new_request", new_request))
@@ -1571,4 +1669,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if "--healthcheck" in sys.argv:
+        raise SystemExit(container_healthcheck())
     main()
