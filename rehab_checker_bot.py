@@ -927,10 +927,14 @@ async def click_text_control(page: Page, text: str) -> None:
 
 async def live_choices(page: Page) -> list[str]:
     """Read category/subcategory labels from the current official UI."""
-    controls = page.locator('main button, main a[href], main [role="button"], main [tabindex="0"]')
+    # The live page exposes actual choices as div[role="button"]. Limit the
+    # discovery surface to semantic buttons so radio modes, feedback widgets,
+    # footer links, and search fields never become inquiry categories.
+    controls = page.locator('main [role="button"]:not([role="radio"])')
     ignored = re.compile(
-        r"^(חיפוש|חזרה|שליחה|המשך|ביטול|נקה|פתיחה|סגירה|העלאת קובץ|צירוף קובץ|"
-        r"לפי נושא|לפי גורם מטפל|תצוגה מורחבת)$",
+        r"^(חיפוש|חזרה|חזרה למסך הראשי|שליחה|המשך|ביטול|נקה|פתיחה|סגירה|"
+        r"העלאת קובץ|צירוף קובץ|נושא הפנייה|גורמים מטפלים|תצוגה מורחבת|"
+        r"אהבתי|יש מה לשפר|יש בעיה טכנית|לא היה לי נוח|לא היה לי ברור|אחר)$",
         re.I,
     )
     result: list[str] = []
@@ -947,6 +951,7 @@ async def live_choices(page: Page) -> list[str]:
         if text.startswith("אגף השיקום") or text in {"לאזור האישי", "יציאה"}:
             continue
         result.append(text)
+    log_event("inquiry.choices_discovered" if result else "inquiry.choices_missing")
     return result
 
 
@@ -966,6 +971,7 @@ async def start_inquiry_ui(chat_id: int, update: Update, run: LoginRun) -> None:
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("נושא הפנייה", callback_data="ir:mode:0")],
         [InlineKeyboardButton("גורמים מטפלים", callback_data="ir:mode:1")],
+        [InlineKeyboardButton("תצוגה מורחבת", callback_data="ir:mode:2")],
         [InlineKeyboardButton("ביטול", callback_data="ir:cancel")],
     ])
     await update.effective_chat.send_message(
@@ -998,7 +1004,7 @@ async def inquiry_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
     if data.startswith("ir:mode:"):
         index = int(data.rsplit(":", 1)[1])
-        modes = ["נושא הפנייה", "גורמים מטפלים"]
+        modes = ["נושא הפנייה", "גורמים מטפלים", "תצוגה מורחבת"]
         if index >= len(modes):
             return
         draft.mode = modes[index]
