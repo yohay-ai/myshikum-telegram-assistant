@@ -54,6 +54,18 @@ class FakePage:
 
 
 class BotTests(unittest.TestCase):
+    def test_polling_accepts_callback_queries(self):
+        source = (ROOT / "rehab_checker_bot.py").read_text()
+        self.assertIn('allowed_updates=["message", "callback_query"]', source)
+
+    def test_all_three_mode_callbacks_are_routed(self):
+        source = (ROOT / "rehab_checker_bot.py").read_text()
+        for index, label in enumerate(("נושא הפנייה", "גורמים מטפלים", "תצוגה מורחבת")):
+            self.assertIn(f'InlineKeyboardButton("{label}", callback_data="ir:mode:{index}")', source)
+        self.assertIn('CallbackQueryHandler(inquiry_callback, pattern=r"^ir:")', source)
+        self.assertIn('index = int(data.rsplit(":", 1)[1])', source)
+        self.assertIn('await click_text_control(run.page, draft.mode)', source)
+
     def test_new_request_route_and_live_mode_labels_match_supplied_page(self):
         source = (ROOT / "rehab_checker_bot.py").read_text()
         self.assertEqual(bot.NEW_REQUEST_URL, "https://myshikum.mod.gov.il/universalRequest/1")
