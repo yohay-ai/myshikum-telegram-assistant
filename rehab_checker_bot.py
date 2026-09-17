@@ -59,7 +59,7 @@ load_dotenv()
 
 BASE_URL = "https://myshikum.mod.gov.il/"
 APPLIES_URL = "https://myshikum.mod.gov.il/applies/"
-NEW_REQUEST_URL = "https://myshikum.mod.gov.il/universalRequest"
+NEW_REQUEST_URL = "https://myshikum.mod.gov.il/universalRequest/1"
 MAX_INQUIRY_TEXT = 450
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 ALLOWED_ATTACHMENT_SUFFIXES = {".doc", ".docx", ".jpg", ".jpeg", ".png", ".pdf", ".tif", ".tiff"}
@@ -890,18 +890,23 @@ def delta_messages(applications: list[str]) -> tuple[list[str], str]:
 
 
 async def goto_new_request(page: Page) -> bool:
+    log_event("inquiry.navigation_started")
     await page.goto(NEW_REQUEST_URL, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
     try:
         await page.wait_for_load_state("networkidle", timeout=10_000)
     except PlaywrightTimeoutError:
         pass
-    return not await looks_logged_out(page) and "/universalrequest" in page.url.lower()
+    ready = not await looks_logged_out(page) and "/universalrequest" in page.url.lower()
+    log_event("inquiry.page_ready" if ready else "inquiry.page_not_ready")
+    return ready
 
 
 async def click_text_control(page: Page, text: str) -> None:
     """Click a live UI control by its exact visible label, never by a stored site ID."""
     pattern = re.compile(rf"^\s*{re.escape(text)}\s*$", re.I)
+    log_event("inquiry.control_lookup_started")
     candidates = [
+        page.get_by_role("radio", name=pattern),
         page.get_by_role("button", name=pattern),
         page.get_by_role("link", name=pattern),
         page.locator('main [role="button"], main [tabindex="0"]').filter(has_text=pattern),
@@ -913,6 +918,7 @@ async def click_text_control(page: Page, text: str) -> None:
                 if await loc.is_visible() and await loc.is_enabled():
                     await loc.click()
                     await page.wait_for_timeout(500)
+                    log_event("inquiry.control_selected")
                     return
             except Exception:
                 continue
@@ -956,9 +962,10 @@ async def start_inquiry_ui(chat_id: int, update: Update, run: LoginRun) -> None:
     if not await goto_new_request(run.page):
         raise RuntimeError(f"ההתחברות הסתיימה אך טופס הפנייה לא נפתח: {run.page.url}")
     run.inquiry = InquiryDraft()
+    log_event("inquiry.telegram_menu_ready")
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("לפי נושא", callback_data="ir:mode:0")],
-        [InlineKeyboardButton("לפי גורם מטפל", callback_data="ir:mode:1")],
+        [InlineKeyboardButton("נושא הפנייה", callback_data="ir:mode:0")],
+        [InlineKeyboardButton("גורמים מטפלים", callback_data="ir:mode:1")],
         [InlineKeyboardButton("ביטול", callback_data="ir:cancel")],
     ])
     await update.effective_chat.send_message(
@@ -991,7 +998,7 @@ async def inquiry_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
     if data.startswith("ir:mode:"):
         index = int(data.rsplit(":", 1)[1])
-        modes = ["לפי נושא", "לפי גורם מטפל"]
+        modes = ["נושא הפנייה", "גורמים מטפלים"]
         if index >= len(modes):
             return
         draft.mode = modes[index]
@@ -1189,12 +1196,14 @@ async def new_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.effective_message.reply_text("כבר מתבצעת פעולה. סיים אותה או הפעל /cancel.")
             return
     await update.effective_message.reply_text("פותח את טופס הפנייה הרשמי...")
+    log_event("inquiry.open_started")
     try:
         run = await start_browser()
         run.action = "new_request"
         async with RUNS_LOCK:
             RUNS[chat_id] = run
         if await goto_new_request(run.page):
+            log_event("inquiry.existing_session_found")
             await start_inquiry_ui(chat_id, update, run)
             return
         await begin_otp_login(run.page)
