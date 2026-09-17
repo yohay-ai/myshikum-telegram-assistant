@@ -16,7 +16,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
     && mkdir -p /app/state \
     && chown -R bot:bot /app
 
-COPY --chown=bot:bot rehab_checker_bot.py ./
+COPY --chown=bot:bot rehab_checker_bot.py .env.example ./
 COPY --chown=bot:bot tests ./tests
 
 USER bot
