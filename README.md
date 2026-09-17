@@ -64,6 +64,26 @@ docker run --rm --init \
 
 GitHub Actions בונה את ה-image ומריץ בו בדיקות בכל pull request ובכל push ל-`main`. שלב הבנייה והבדיקות משתמש רק ב-`contents: read`. אחרי push מוצלח ל-`main`, job נפרד עם `packages: write` מפרסם ל-`ghcr.io/yohay-ai/myshikum-telegram-assistant` עם התגיות `latest` ו-`sha-<commit>`; pull requests לעולם אינם מפרסמים image.
 
+### Docker Compose מ-GHCR
+
+הקובץ `compose.ghcr.yml` משתמש ב-`ghcr.io/yohay-ai/myshikum-telegram-assistant:latest`, טוען secrets ומשתני הגדרה מתוך `.env` בלבד, ושומר את מצב ההתחברות ב-volume בשם `myshikum-state`.
+
+```bash
+cp .env.example .env
+# ערוך את .env מקומית; אל תעלה אותו ל-Git
+docker compose -f compose.ghcr.yml pull
+docker compose -f compose.ghcr.yml up -d
+docker compose -f compose.ghcr.yml logs -f
+```
+
+לעצירה בלי למחוק את מצב ההתחברות:
+
+```bash
+docker compose -f compose.ghcr.yml down
+```
+
+התגית `latest` עוקבת אחרי `main`. לפריסה מקובעת אפשר להחליף אותה בתגית `sha-<commit מלא>` שה-workflow מפרסם. אם החבילה אינה ציבורית, התחבר פעם אחת ל-GHCR עם token בעל `read:packages`; אין לשמור את ה-token בקובץ Compose או ב-`.env`.
+
 ## לוגים
 
 `LOG_LEVEL` שולט ברמת הלוג (ברירת מחדל `INFO`). הלוג מכיל רק שמות אירועים תפעוליים וסוגי שגיאות. אין בו token, קוד חד-פעמי, תעודת זהות, פרטי קשר, chat ID, תוכן פנייה, שמות או תוכן צרופות, cookies או מצב session. גם לוגים מפורטים של ספריות HTTP, Telegram ו-Playwright אינם מופעלים.
