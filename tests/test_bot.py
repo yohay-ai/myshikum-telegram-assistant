@@ -1,11 +1,12 @@
 import asyncio
 import importlib.util
+import logging
 import os
 import tempfile
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault("TELEGRAM_TOKEN", "test-token")
@@ -53,6 +54,69 @@ class FakePage:
 
 
 class BotTests(unittest.TestCase):
+    def test_help_lists_all_commands(self):
+        for command in ("/help", "/check", "/new_request", "/review", "/cancel", "/logout", "/whoami", "/autocheck_start", "/autocheck_stop", "/autocheck_status"):
+            self.assertIn(command, bot.HELP_TEXT)
+
+    def test_autocheck_interval_rejects_too_fast_and_invalid_values(self):
+        original = bot.AUTOCHECK_INTERVAL_MINUTES_RAW
+        try:
+            for value in ("nope", "0", "14", "-5"):
+                bot.AUTOCHECK_INTERVAL_MINUTES_RAW = value
+                self.assertIsNone(bot.configured_autocheck_interval())
+            bot.AUTOCHECK_INTERVAL_MINUTES_RAW = "15"
+            self.assertEqual(bot.configured_autocheck_interval(), 15)
+            bot.AUTOCHECK_INTERVAL_MINUTES_RAW = "60"
+            self.assertEqual(bot.configured_autocheck_interval(), 60)
+        finally:
+            bot.AUTOCHECK_INTERVAL_MINUTES_RAW = original
+
+    def test_seen_state_persists_only_digests(self):
+        original = bot.SEEN_MESSAGES
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                bot.SEEN_MESSAGES = Path(d) / "seen.json"
+                bot.delta_messages([
+                    "פנייה באתר רפואה מספר פנייה 123 מצב טיפול פתוח "
+                    "תאריך עדכון 01/01/2026 תוכן רפואי פרטי"
+                ])
+                stored = bot.SEEN_MESSAGES.read_text()
+                self.assertIn('"version": 3', stored)
+                self.assertIn("raw_digest", stored)
+                self.assertNotIn("תוכן רפואי", stored)
+                self.assertNotIn("subject", stored)
+                self.assertNotIn("events", stored)
+        finally:
+            bot.SEEN_MESSAGES = original
+
+    def test_autocheck_is_command_only(self):
+        example = (ROOT / ".env.example").read_text()
+        source = (ROOT / "rehab_checker_bot.py").read_text()
+        self.assertNotIn("AUTOCHECK_ENABLED", example)
+        self.assertNotIn("AUTOCHECK_ENABLED", source)
+        self.assertNotIn("post_init(", source)
+        self.assertIn("AUTOCHECK_INTERVAL_MINUTES=60", example)
+        self.assertIn('CommandHandler("autocheck_start"', source)
+        self.assertIn('CommandHandler("autocheck_stop"', source)
+
+    def test_operational_log_excludes_error_message(self):
+        handler = Mock()
+        handler.level = logging.NOTSET
+        original_handlers = list(bot.LOGGER.handlers)
+        original_level = bot.LOGGER.level
+        bot.LOGGER.handlers = [handler]
+        bot.LOGGER.setLevel(logging.INFO)
+        try:
+            bot.log_event("browser.failed", level=logging.ERROR, error=RuntimeError("OTP 1234 token secret"))
+            record = handler.handle.call_args.args[0]
+            rendered = record.getMessage()
+            self.assertEqual(rendered, "browser.failed error_type=RuntimeError")
+            self.assertNotIn("1234", rendered)
+            self.assertNotIn("secret", rendered)
+        finally:
+            bot.LOGGER.handlers = original_handlers
+            bot.LOGGER.setLevel(original_level)
+
     def test_no_secret_values_in_source(self):
         source = (ROOT / "rehab_checker_bot.py").read_text()
         self.assertNotIn("TELEGRAM_TOKEN=", source)
