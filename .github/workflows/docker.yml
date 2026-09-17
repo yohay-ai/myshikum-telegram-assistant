@@ -52,7 +52,7 @@ jobs:
           docker run --rm
           --entrypoint python
           myshikum-telegram-assistant:test
-          -c "import asyncio; from playwright.async_api import async_playwright; exec('async def smoke():\n async with async_playwright() as p:\n  browser = await p.chromium.launch(channel=\"chromium\", headless=True, args=[\"--disable-dev-shm-usage\"]); print(await browser.version()); await browser.close()\nasyncio.run(smoke())')"
+          -c "import asyncio; from playwright.async_api import async_playwright; exec('async def smoke():\n async with async_playwright() as p:\n  browser = await p.chromium.launch(channel=\"chromium\", headless=True, args=[\"--disable-dev-shm-usage\"]); print(browser.version); await browser.close()\nasyncio.run(smoke())')"
 
   publish:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
