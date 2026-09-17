@@ -54,6 +54,12 @@ class FakePage:
 
 
 class BotTests(unittest.TestCase):
+    def test_new_request_route_and_live_mode_labels_match_supplied_page(self):
+        source = (ROOT / "rehab_checker_bot.py").read_text()
+        self.assertEqual(bot.NEW_REQUEST_URL, "https://myshikum.mod.gov.il/universalRequest/1")
+        self.assertIn('modes = ["נושא הפנייה", "גורמים מטפלים"]', source)
+        self.assertIn('get_by_role("radio", name=pattern)', source)
+
     def test_help_lists_all_commands(self):
         for command in ("/help", "/check", "/new_request", "/review", "/cancel", "/logout", "/whoami", "/autocheck_start", "/autocheck_stop", "/autocheck_status"):
             self.assertIn(command, bot.HELP_TEXT)
