@@ -1,0 +1,15 @@
+services:
+  myshikum-assistant:
+    image: ghcr.io/yohay-ai/myshikum-telegram-assistant:latest
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      STATE_DIR: /app/state
+      HEADLESS: "true"
+    volumes:
+      - myshikum-state:/app/state
+
+volumes:
+  myshikum-state:
